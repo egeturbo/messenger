@@ -34,6 +34,7 @@ class Connection
         'auto_setup' => true,
         'stream_max_entries' => 0, // any value higher than 0 defines an approximate maximum number of stream entries
         'dbindex' => 0,
+        'delete_after_ack' => true,
     ];
 
     private $connection;
@@ -44,6 +45,7 @@ class Connection
     private $autoSetup;
     private $maxEntries;
     private $couldHavePendingMessages = true;
+    private $deleteAfterAck;
 
     public function __construct(array $configuration, array $connectionCredentials = [], array $redisOptions = [], \Redis $redis = null)
     {
@@ -80,6 +82,7 @@ class Connection
         $this->queue = $this->stream.'__queue';
         $this->autoSetup = $configuration['auto_setup'] ?? self::DEFAULT_OPTIONS['auto_setup'];
         $this->maxEntries = $configuration['stream_max_entries'] ?? self::DEFAULT_OPTIONS['stream_max_entries'];
+        $this->deleteAfterAck = $configuration['delete_after_ack'] ?? self::DEFAULT_OPTIONS['delete_after_ack'];
     }
 
     public static function fromDsn(string $dsn, array $redisOptions = [], \Redis $redis = null): self
@@ -126,6 +129,12 @@ class Connection
             unset($redisOptions['dbindex']);
         }
 
+        $deleteAfterAck = null;
+        if (\array_key_exists('delete_after_ack', $redisOptions)) {
+            $deleteAfterAck = filter_var($redisOptions['delete_after_ack'], FILTER_VALIDATE_BOOLEAN);
+            unset($redisOptions['delete_after_ack']);
+        }
+
         return new self([
             'stream' => $stream,
             'group' => $group,
@@ -133,6 +142,7 @@ class Connection
             'auto_setup' => $autoSetup,
             'stream_max_entries' => $maxEntries,
             'dbindex' => $dbIndex,
+            'delete_after_ack' => $deleteAfterAck,
         ], $connectionCredentials, $redisOptions, $redis);
     }
 
@@ -215,6 +225,9 @@ class Connection
     {
         try {
             $acknowledged = $this->connection->xack($this->stream, $this->group, [$id]);
+            if ($this->deleteAfterAck) {
+                $acknowledged = $this->connection->xdel($this->stream, [$id]);
+            }
         } catch (\RedisException $e) {
             throw new TransportException($e->getMessage(), 0, $e);
         }
@@ -317,6 +330,18 @@ class Connection
         // group might already exist, ignore
         if ($this->connection->getLastError()) {
             $this->connection->clearLastError();
+        }
+
+        if ($this->deleteAfterAck) {
+            $groups = $this->connection->xinfo('GROUPS', $this->stream);
+            if (
+                // support for Redis extension version 5+
+                (\is_array($groups) && 1 < \count($groups))
+                // support for Redis extension version 4.x
+                || (\is_string($groups) && substr_count($groups, '"name"'))
+            ) {
+                throw new LogicException(sprintf('More than one group exists for stream "%s", delete_after_ack can not be enabled as it risks deleting messages before all groups could consume them.', $this->stream));
+            }
         }
 
         $this->autoSetup = false;
